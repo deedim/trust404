@@ -1,0 +1,1 @@
+{"name":"trust404-track3","private":true,"type":"module","scripts":{"test":"node --test","demo":"node src/cli.js demo"},"engines":{"node":">=22"}}
