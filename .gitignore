@@ -4,4 +4,6 @@
 demo-output*/
 node_modules/
 
-package-lock.json
+out/
+cache/
+*.sqlite*

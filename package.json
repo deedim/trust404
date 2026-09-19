@@ -1,1 +1,19 @@
-{"name":"trust404-track3","private":true,"type":"module","scripts":{"test":"node --test","demo":"node src/cli.js demo"},"engines":{"node":">=22"}}
+{
+  "name": "trust404-track3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js test/v3/*.test.js",
+    "demo": "node src/cli.js demo",
+    "test:contracts": "forge test",
+    "test:integration": "forge build && node --test test/integration/*.test.js",
+    "evidence": "node src/v3/cli.js"
+  },
+  "engines": {
+    "node": ">=22.22.2"
+  },
+  "dependencies": {
+    "canonicalize": "5.0.0",
+    "viem": "2.56.8"
+  }
+}
