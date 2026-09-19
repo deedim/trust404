@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, renameSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { createSystem, validatePolicy, verifyReceipt, verifySingle, audit, decodePayload, encodePayload } from './evidence.js';
+import { JsonRpcProvider } from 'ethers';
+import { createSystem, validatePolicy, verifyReceipt, verifySingle, audit, decodePayload, encodePayload, hash, sign } from './evidence.js';
 import { deployEvmWitness } from './evm.js';
 
 const read = path => JSON.parse(readFileSync(path, 'utf8'));
@@ -91,18 +92,63 @@ async function demo(destination) {
       system.entries.filter(e => e.record.index !== decision.record.index)
     );
 
+    const missingSystem = createSystem({
+      witness,
+      keys: system.keys,
+      onPayload: bytes => write(join(out, 'attacks/missing-request.json'), bytes),
+      onAppend: entries => write(join(out, 'attacks/missing-log.json'), entries)
+    });
+    missingSystem.entries.push(...structuredClone(system.entries));
+    await missingSystem.submit('unanswered', 1500000);
+    const clock = new JsonRpcProvider(process.env.RPC_URL);
+    try {
+      await clock.send('evm_increaseTime', [missingSystem.policy.decisionWindow]);
+    } finally {
+      clock.destroy();
+    }
+    const missingTrust = await missingSystem.trust();
+    write(join(out, 'attacks/missing-trust.json'), missingTrust);
+
+    const wrongPolicySystem = createSystem({
+      witness,
+      keys: system.keys,
+      onPayload: bytes => write(join(out, 'attacks/wrong-policy-request.json'), bytes)
+    });
+    wrongPolicySystem.entries.push(...structuredClone(missingSystem.entries));
+    const wrongPolicyRequest = await wrongPolicySystem.submit('wrong-policy', 1500000);
+    const wrongPolicyBytes = encodePayload(sign('decision', {
+      version: 1,
+      requestHash: hash(decodePayload(wrongPolicyRequest.payloadBytes, wrongPolicyRequest.record)),
+      policyHash: hash(system.policy),
+      outcome: 'APPROVED',
+      reason: 'WITHIN_LIMIT'
+    }, system.keys.institution.privateKey));
+    write(join(out, 'attacks/wrong-policy-decision.json'), wrongPolicyBytes);
+    const registration = await witness.registerDecision(wrongPolicyRequest.record.index, wrongPolicyBytes);
+    const wrongPolicyDecision = {
+      payloadBytes: wrongPolicyBytes,
+      record: registration.entry,
+      checkpointId: registration.checkpointId
+    };
+    wrongPolicySystem.entries.push(wrongPolicyDecision);
+    const wrongPolicyTrust = await wrongPolicySystem.trust(registration.checkpointId);
+    const wrongPolicyResult = wrongPolicySystem.bundle(wrongPolicyRequest, wrongPolicyDecision, wrongPolicyTrust);
+    write(join(out, 'attacks/wrong-policy-result.json'), wrongPolicyResult);
+    write(join(out, 'attacks/wrong-policy-trust.json'), wrongPolicyTrust);
+
     writeFileSync(
       join(out, 'README.txt'),
-      '송금 판단 검증 시연: 실제 송금 없이 EVM 체인의 EvidenceLog 계약에 요청·판단 해시를 등록합니다.\ncustomer: 고객 보관 증거\nauditor/trust.json: 사전 전달된 신뢰 기준 역할\nwitness: 외부 기록 주체의 계약 기록과 원문을 보관하는 로컬 저장소 역할\ninstitution: 기관 저장소 역할 (검증기는 읽지 않음)\nattacks: 공격별 독립 시연 파일\n시각과 순번은 계약 기록을 사용합니다.\n실제 운영에서는 각 역할을 별도 환경에서 운영하고 공개키·체크포인트를 독립 경로로 전달해야 합니다.\n'
+      '송금 판단 검증 시연: 실제 송금 없이 EVM 체인의 EvidenceLog 계약에 요청·판단 해시를 등록합니다.\ncustomer: 고객 보관 증거\nauditor/trust.json: 사전 전달된 신뢰 기준 역할\nwitness: 외부 기록 주체의 계약 기록과 원문을 보관하는 로컬 저장소 역할\ninstitution: 기관 저장소 역할 (검증기는 읽지 않음)\nattacks: 공격별 시연 파일과 해당 감사 범위의 신뢰 기준\n시각과 순번은 계약 기록을 사용합니다. 미처리 시연에서는 Anvil의 블록 시각을 60초 진행합니다.\n실제 운영에서는 각 역할을 별도 환경에서 운영하고 공개키·체크포인트를 독립 경로로 전달해야 합니다.\n'
     );
 
     const checks = [];
-    const check = (name, fn, expected) => {
+    const check = (name, fn, expected, expectedError) => {
       let actual;
 
       try {
         actual = fn().ok ? 'PASS' : 'DETECTED';
-      } catch {
+      } catch (error) {
+        if (expectedError && error.message !== expectedError) throw error;
         actual = 'DETECTED';
       }
 
@@ -130,6 +176,17 @@ async function demo(destination) {
       '목록 삭제',
       () => audit(read(join(out, 'attacks/deleted-log.json')), trust),
       'DETECTED'
+    );
+    const missingReport = audit(
+      read(join(out, 'attacks/missing-log.json')),
+      readTrust(join(out, 'attacks/missing-trust.json'))
+    );
+    check('접수 후 판단 누락', () => missingReport, 'DETECTED');
+    check(
+      '정책 위반 판단',
+      () => verifySingle(wrongPolicyResult, wrongPolicyTrust),
+      'DETECTED',
+      'POLICY_MISMATCH'
     );
 
     return { ok: true, output: out, checks };
