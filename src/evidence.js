@@ -1,183 +1,438 @@
-import { createHash, generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
+import {
+  createHash,
+  generateKeyPairSync,
+  sign as cryptoSign,
+  verify as cryptoVerify
+} from 'node:crypto';
+import {
+  verifyInclusions,
+  checkedLog,
+  leafHash,
+  payloadHash,
+  safeNumber
+} from './evm.js';
 
-function requireThat(condition, code) { if (!condition) throw new Error(code); }
+function requireThat(condition, code) {
+  if (!condition) throw new Error(code);
+}
+
 export function canonical(value) {
   if (value === null || typeof value === 'boolean') return JSON.stringify(value);
+
   if (typeof value === 'string') {
     requireThat(value === value.normalize('NFC'), 'NON_CANONICAL_STRING');
     return JSON.stringify(value);
   }
+
   if (typeof value === 'number') {
     requireThat(Number.isSafeInteger(value) && !Object.is(value, -0), 'INVALID_NUMBER');
     return String(value);
   }
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+
+  if (Array.isArray(value)) {
+    const elements = value.map(canonical);
+    return `[${elements.join(',')}]`;
+  }
+
   requireThat(value && Object.getPrototypeOf(value) === Object.prototype, 'INVALID_JSON_VALUE');
-  return `{${Object.keys(value).sort().map(k => `${canonical(k)}:${canonical(value[k])}`).join(',')}}`;
+  const sortedKeys = Object.keys(value).sort();
+  const properties = sortedKeys.map(k => {
+    const encodedKey = canonical(k);
+    const encodedValue = canonical(value[k]);
+    return `${encodedKey}:${encodedValue}`;
+  });
+  return `{${properties.join(',')}}`;
 }
-const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-export const hash = value => digest(Buffer.from(canonical(value)));
-const leaf = entry => digest(Buffer.concat([Buffer.from([0]), Buffer.from(canonical(entry))]));
-const branch = (left, right) => digest(Buffer.concat([Buffer.from([1]), Buffer.from(left, 'hex'), Buffer.from(right, 'hex')]));
-const split = n => 2 ** Math.floor(Math.log2(n - 1));
-const isHash = h => typeof h === 'string' && /^[a-f0-9]{64}$/.test(h);
-export function merkle(entries) {
-  if (!entries.length) return digest(Buffer.alloc(0));
-  if (entries.length === 1) return leaf(entries[0]);
-  const k = split(entries.length);
-  return branch(merkle(entries.slice(0, k)), merkle(entries.slice(k)));
-}
-export function proof(entries, index) {
-  requireThat(Number.isSafeInteger(index) && index >= 0 && index < entries.length, 'INVALID_INDEX');
-  if (entries.length === 1) return [];
-  const k = split(entries.length);
-  return index < k
-    ? [...proof(entries.slice(0, k), index), { side: 'right', hash: merkle(entries.slice(k)) }]
-    : [...proof(entries.slice(k), index - k), { side: 'left', hash: merkle(entries.slice(0, k)) }];
-}
-export function verifyProof(entry, index, size, path, root) {
-  if (!Number.isSafeInteger(size) || size < 1 || !Number.isSafeInteger(index) || index < 0 || index >= size || !Array.isArray(path) || !isHash(root)) return false;
-  function directions(i, n) {
-    if (n === 1) return [];
-    const k = split(n);
-    return i < k ? [...directions(i, k), 'right'] : [...directions(i - k, n - k), 'left'];
-  }
-  const expected = directions(index, size);
-  if (path.length !== expected.length) return false;
-  let current = leaf(entry);
-  for (let i = 0; i < path.length; i++) {
-    if (path[i]?.side !== expected[i] || !isHash(path[i]?.hash)) return false;
-    current = path[i].side === 'left' ? branch(path[i].hash, current) : branch(current, path[i].hash);
-  }
-  return current === root;
-}
+
+export const hash = value => {
+  const digest = createHash('sha256');
+  const bytes = Buffer.from(canonical(value));
+  return digest.update(bytes).digest('hex');
+};
+
 export function sign(domain, payload, key) {
-  return { domain, payload, signature: cryptoSign(null, Buffer.from(canonical({ domain, payload })), key).toString('base64') };
+  const bytes = Buffer.from(canonical({ domain, payload }));
+  const rawSignature = cryptoSign(null, bytes, key);
+  return {
+    domain,
+    payload,
+    signature: rawSignature.toString('base64')
+  };
 }
+
 function signature(envelope, domain, key) {
-  requireThat(envelope?.domain === domain && typeof envelope.signature === 'string', 'INVALID_ENVELOPE');
+  requireThat(
+    envelope?.domain === domain && typeof envelope.signature === 'string',
+    'INVALID_ENVELOPE'
+  );
+  const envelopeFields = Object.keys(envelope).sort().join(',');
+  requireThat(envelopeFields === 'domain,payload,signature', 'INVALID_ENVELOPE');
+
   const raw = Buffer.from(envelope.signature, 'base64');
-  requireThat(raw.length === 64 && raw.toString('base64') === envelope.signature, 'INVALID_SIGNATURE_ENCODING');
-  requireThat(cryptoVerify(null, Buffer.from(canonical({ domain, payload: envelope.payload })), key, raw), 'INVALID_SIGNATURE');
+  requireThat(
+    raw.length === 64 && raw.toString('base64') === envelope.signature,
+    'INVALID_SIGNATURE_ENCODING'
+  );
+  const signedBytes = Buffer.from(canonical({ domain, payload: envelope.payload }));
+  const validSignature = cryptoVerify(null, signedBytes, key, raw);
+  requireThat(validSignature, 'INVALID_SIGNATURE');
+
   return envelope.payload;
 }
+
 function fields(object, keys) {
-  requireThat(object && canonical(Object.keys(object).sort()) === canonical([...keys].sort()), 'INVALID_SCHEMA');
+  requireThat(
+    object && Object.getPrototypeOf(object) === Object.prototype,
+    'INVALID_SCHEMA'
+  );
+  const actualFields = canonical(Object.keys(object).sort());
+  const expectedFields = canonical([...keys].sort());
+  requireThat(actualFields === expectedFields, 'INVALID_SCHEMA');
 }
-function timestamp(value) { requireThat(Number.isSafeInteger(value) && value >= 0, 'INVALID_TIME'); }
-function validatePolicy(policy) {
+
+export function validatePolicy(policy) {
   fields(policy, ['version', 'id', 'institution', 'currency', 'limit', 'decisionWindow']);
-  requireThat(policy.version === 1 && policy.id === 'per-transfer-limit-v1' && policy.institution === 'demo-bank' && policy.currency === 'KRW' && policy.limit === 1000000 && policy.decisionWindow === 60, 'UNSUPPORTED_POLICY');
+  requireThat(
+    policy.version === 1
+    && policy.id === 'per-transfer-limit-v1'
+    && policy.institution === 'demo-bank'
+    && policy.currency === 'KRW'
+    && policy.limit === 1000000
+    && policy.decisionWindow === 60,
+    'UNSUPPORTED_POLICY'
+  );
 }
-function requestPayload(envelope, trust) {
+
+export function requestPayload(envelope, trust) {
   const r = signature(envelope, 'request', trust.customerKey);
   fields(r, ['version', 'id', 'customer', 'institution', 'amount', 'currency', 'policyHash']);
-  requireThat(r.version === 1 && typeof r.id === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(r.id), 'INVALID_REQUEST');
-  requireThat(r.customer === 'demo-customer' && r.institution === trust.policy.institution && r.currency === 'KRW' && r.policyHash === hash(trust.policy), 'REQUEST_CONTEXT_MISMATCH');
+  requireThat(
+    r.version === 1
+    && typeof r.id === 'string'
+    && /^[a-zA-Z0-9_-]{1,100}$/.test(r.id),
+    'INVALID_REQUEST'
+  );
+  requireThat(
+    r.customer === 'demo-customer'
+    && r.institution === trust.policy.institution
+    && r.currency === 'KRW'
+    && r.policyHash === hash(trust.policy),
+    'REQUEST_CONTEXT_MISMATCH'
+  );
   requireThat(Number.isSafeInteger(r.amount) && r.amount > 0, 'INVALID_AMOUNT');
+
   return r;
 }
-function expectedDecision(r) {
-  return r.amount > 1000000 ? { outcome: 'REJECTED', reason: 'LIMIT_EXCEEDED' } : { outcome: 'APPROVED', reason: 'WITHIN_LIMIT' };
+
+export function expectedDecision(r) {
+  return r.amount > 1000000
+    ? { outcome: 'REJECTED', reason: 'LIMIT_EXCEEDED' }
+    : { outcome: 'APPROVED', reason: 'WITHIN_LIMIT' };
 }
-function decisionPayload(envelope, request, trust) {
+
+export function decisionPayload(envelope, request, trust) {
   const d = signature(envelope, 'decision', trust.institutionKey);
   fields(d, ['version', 'requestHash', 'policyHash', 'outcome', 'reason']);
-  requireThat(d.version === 1 && d.requestHash === hash(request) && d.policyHash === hash(trust.policy), 'DECISION_CONTEXT_MISMATCH');
+  requireThat(
+    d.version === 1
+    && d.requestHash === hash(request)
+    && d.policyHash === hash(trust.policy),
+    'DECISION_CONTEXT_MISMATCH'
+  );
+
   const expected = expectedDecision(request.payload);
   requireThat(d.outcome === expected.outcome && d.reason === expected.reason, 'POLICY_MISMATCH');
   return d;
 }
-function checkpoint(trust) {
-  validatePolicy(trust.policy);
-  const c = signature(trust.checkpoint, 'checkpoint', trust.witnessKey);
-  fields(c, ['version', 'logId', 'size', 'root', 'issuedAt']);
-  timestamp(c.issuedAt);
-  requireThat(c.version === 1 && c.logId === 'trust404-demo' && Number.isSafeInteger(c.size) && c.size >= 0 && isHash(c.root), 'INVALID_CHECKPOINT');
-  return c;
-}
-function entryShape(entry, c) {
-  const isRequest = entry?.evidence?.domain === 'request';
-  fields(entry, isRequest ? ['index', 'acceptedAt', 'deadline', 'evidence'] : ['index', 'acceptedAt', 'evidence']);
-  fields(entry.evidence, ['domain', 'payload', 'signature']);
-  requireThat(Number.isSafeInteger(entry.index) && entry.index >= 0 && entry.index < c.size, 'INVALID_INDEX');
-  timestamp(entry.acceptedAt);
-  requireThat(entry.acceptedAt <= c.issuedAt, 'FUTURE_ENTRY');
-  requireThat(isRequest || entry.evidence.domain === 'decision', 'UNKNOWN_ENTRY');
-  if (isRequest) requireThat(Number.isSafeInteger(entry.deadline) && entry.deadline === entry.acceptedAt + 60, 'INVALID_DEADLINE');
-}
-export function verifySingle(bundle, trust) {
-  const c = checkpoint(trust);
-  requireThat(canonical(bundle.checkpoint) === canonical(trust.checkpoint), 'CHECKPOINT_MISMATCH');
-  for (const item of [bundle.request, bundle.decision]) {
-    entryShape(item.entry, c);
-    requireThat(verifyProof(item.entry, item.entry.index, c.size, item.proof, c.root), 'INVALID_INCLUSION_PROOF');
+
+export const encodePayload = envelope => {
+  const bytes = Buffer.from(canonical(envelope), 'utf8');
+  return `0x${bytes.toString('hex')}`;
+};
+
+export function decodePayload(bytes, record) {
+  requireThat(bytes !== null && bytes !== undefined, 'MISSING_PAYLOAD');
+  requireThat(payloadHash(bytes) === record.payloadHash.toLowerCase(), 'PAYLOAD_HASH_MISMATCH');
+
+  let envelope;
+
+  try {
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const payloadBytes = Buffer.from(bytes.slice(2), 'hex');
+    const json = decoder.decode(payloadBytes);
+    envelope = JSON.parse(json);
+  } catch {
+    throw new Error('INVALID_PAYLOAD');
   }
-  const r = requestPayload(bundle.request.entry.evidence, trust);
-  const d = decisionPayload(bundle.decision.entry.evidence, bundle.request.entry.evidence, trust);
-  requireThat(bundle.request.entry.index < bundle.decision.entry.index && bundle.request.entry.acceptedAt <= bundle.decision.entry.acceptedAt, 'INVALID_EVENT_ORDER');
-  return { ok: true, requestId: r.id, amount: r.amount, outcome: d.outcome, reason: d.reason };
-}
-export function audit(entries, trust) {
-  const c = checkpoint(trust);
-  requireThat(Array.isArray(entries) && entries.length === c.size, 'LOG_SIZE_MISMATCH');
-  requireThat(merkle(entries) === c.root, 'LOG_ROOT_MISMATCH');
-  const requests = new Map(); const ids = new Set(); const decisions = new Set();
-  let previousTime = 0;
-  entries.forEach((entry, index) => {
-    entryShape(entry, c);
-    requireThat(entry.index === index && entry.acceptedAt >= previousTime, 'INVALID_LOG_ORDER');
-    previousTime = entry.acceptedAt;
-    if (entry.evidence.domain === 'request') {
-      const r = requestPayload(entry.evidence, trust);
-      requireThat(!ids.has(r.id), 'DUPLICATE_REQUEST'); ids.add(r.id);
-      requests.set(hash(entry.evidence), entry);
-    } else {
-      const key = entry.evidence.payload.requestHash;
-      requireThat(requests.has(key) && !decisions.has(key), 'UNMATCHED_OR_DUPLICATE_DECISION');
-      decisionPayload(entry.evidence, requests.get(key).evidence, trust); decisions.add(key);
-    }
-  });
-  const pending = []; const overdue = [];
-  for (const [key, entry] of requests) if (!decisions.has(key)) (c.issuedAt >= entry.deadline ? overdue : pending).push(entry.evidence.payload.id);
-  return { ok: overdue.length === 0, requests: requests.size, decisions: decisions.size, pending, overdue };
+
+  requireThat(envelope && typeof envelope === 'object', 'INVALID_ENVELOPE');
+  const envelopeFields = Object.keys(envelope).sort().join(',');
+  requireThat(envelopeFields === 'domain,payload,signature', 'INVALID_ENVELOPE');
+  return envelope;
 }
 
-// The demo coordinator holds all keys in memory. Production actors must not share this boundary.
-export function createSystem({ onAppend = () => {} } = {}) {
-  const keys = Object.fromEntries(['customer', 'institution', 'witness'].map(role => [role, generateKeyPairSync('ed25519')]));
-  const policy = { version: 1, id: 'per-transfer-limit-v1', institution: 'demo-bank', currency: 'KRW', limit: 1000000, decisionWindow: 60 };
-  const entries = [];
-  const baseTrust = { policy, ...Object.fromEntries(Object.entries(keys).map(([role, pair]) => [`${role}Key`, pair.publicKey.export({ type: 'spki', format: 'pem' })])) };
-  function append(evidence, acceptedAt) {
-    timestamp(acceptedAt);
-    requireThat(!entries.length || acceptedAt >= entries.at(-1).acceptedAt, 'INVALID_LOG_ORDER');
-    const entry = { index: entries.length, acceptedAt, ...(evidence.domain === 'request' ? { deadline: acceptedAt + policy.decisionWindow } : {}), evidence };
-    // Persist externally before acknowledging the request or decision.
-    onAppend(structuredClone([...entries, entry]));
-    entries.push(entry); return entry;
-  }
+export function verifyReceipt(bundle, trust) {
+  requireThat(bundle?.request, 'MISSING_EVIDENCE');
+  const inclusion = {
+    entry: bundle.request.entry?.record,
+    proof: bundle.request.proof
+  };
+  const { entries: records } = verifyInclusions([inclusion], bundle.checkpointId, trust);
+  const [record] = records;
+  requireThat(record.kind === 0n, 'EXPECTED_REQUEST');
+  const envelope = decodePayload(bundle.request.entry.payloadBytes, record);
+  const r = requestPayload(envelope, trust);
+  return { ok: true, requestId: r.id, index: safeNumber(record.index) };
+}
+
+export function verifySingle(bundle, trust) {
+  requireThat(bundle?.request && bundle.decision, 'MISSING_EVIDENCE');
+  const items = [bundle.request, bundle.decision];
+  const inclusions = items.map(item => ({ entry: item.entry?.record, proof: item.proof }));
+  const { entries: records } = verifyInclusions(inclusions, bundle.checkpointId, trust);
+  const [requestRecord, decisionRecord] = records;
+  const [requestEnvelope, decisionEnvelope] = items.map((item, index) =>
+    decodePayload(item.entry.payloadBytes, records[index]));
+
+  requireThat(
+    requestRecord.kind === 0n
+    && decisionRecord.kind === 1n
+    && decisionRecord.requestIndex === requestRecord.index,
+    'DECISION_LINK_MISMATCH'
+  );
+
+  const r = requestPayload(requestEnvelope, trust);
+  const d = decisionPayload(decisionEnvelope, requestEnvelope, trust);
+  requireThat(
+    requestRecord.recordedAt <= decisionRecord.recordedAt,
+    'INVALID_EVENT_ORDER'
+  );
+
   return {
-    keys, entries, policy,
-    submit(id, amount, now) {
-      const envelope = sign('request', { version: 1, id, customer: 'demo-customer', institution: policy.institution, amount, currency: 'KRW', policyHash: hash(policy) }, keys.customer.privateKey);
-      requestPayload(envelope, baseTrust);
-      requireThat(!entries.some(e => e.evidence.domain === 'request' && e.evidence.payload.id === id), 'DUPLICATE_REQUEST');
-      return append(envelope, now);
-    },
-    decide(request, now) {
-      requireThat(entries.includes(request) && request.evidence.domain === 'request', 'REQUEST_NOT_RECEIVED');
-      const r = requestPayload(request.evidence, baseTrust);
-      requireThat(!entries.some(e => e.evidence.domain === 'decision' && e.evidence.payload.requestHash === hash(request.evidence)), 'DUPLICATE_DECISION');
-      return append(sign('decision', { version: 1, requestHash: hash(request.evidence), policyHash: hash(policy), ...expectedDecision(r) }, keys.institution.privateKey), now);
-    },
-    trust(now) {
-      timestamp(now); requireThat(!entries.length || now >= entries.at(-1).acceptedAt, 'INVALID_CHECKPOINT_TIME');
-      return { ...baseTrust, checkpoint: sign('checkpoint', { version: 1, logId: 'trust404-demo', size: entries.length, root: merkle(entries), issuedAt: now }, keys.witness.privateKey) };
-    },
-    bundle(request, decision, trust) {
-      requireThat(merkle(entries) === trust.checkpoint.payload.root && entries.length === trust.checkpoint.payload.size, 'CHECKPOINT_MISMATCH');
-      return structuredClone({ checkpoint: trust.checkpoint, request: { entry: request, proof: proof(entries, request.index) }, decision: { entry: decision, proof: proof(entries, decision.index) } });
-    },
+    ok: true,
+    requestId: r.id,
+    amount: r.amount,
+    outcome: d.outcome,
+    reason: d.reason
+  };
+}
+
+export function audit(entries, trust) {
+  requireThat(Array.isArray(entries), 'LOG_SIZE_MISMATCH');
+  const rawRecords = entries.map(entry => entry.record);
+  const { checkpointInfo: info, entries: records } = checkedLog(rawRecords, trust);
+
+  const requests = new Map();
+  const reqIds = new Set();
+  const decisions = new Set();
+
+  entries.forEach((entry, index) => {
+    const record = records[index];
+    const envelope = decodePayload(entry.payloadBytes, record);
+
+    if (record.kind === 0n) {
+      requireThat(record.actor.toLowerCase() === trust.customerAddress.toLowerCase(), 'ACTOR_MISMATCH');
+      const r = requestPayload(envelope, trust);
+      requireThat(!reqIds.has(r.id), 'DUPLICATE_REQUEST');
+      reqIds.add(r.id);
+      requests.set(record.index, { record, envelope });
+    } else {
+      const key = record.requestIndex;
+      decisionPayload(envelope, requests.get(key).envelope, trust);
+      decisions.add(key);
+    }
+  });
+
+  const pending = [];
+  const overdue = [];
+  for (const [key, request] of requests) {
+    if (decisions.has(key)) continue;
+
+    const deadline = request.record.recordedAt + BigInt(trust.policy.decisionWindow);
+    const id = request.envelope.payload.id;
+    if (info.checkpoint.issuedAt >= deadline) {
+      overdue.push(id);
+    } else {
+      pending.push(id);
+    }
+  }
+
+  return {
+    ok: overdue.length === 0,
+    requests: requests.size,
+    decisions: decisions.size,
+    pending,
+    overdue
+  };
+}
+
+export function createSystem({
+  witness,
+  onPayload = () => { },
+  onAppend = () => { },
+  keys = {
+    customer: generateKeyPairSync('ed25519'),
+    institution: generateKeyPairSync('ed25519')
+  }
+} = {}) {
+  const policy = {
+    version: 1,
+    id: 'per-transfer-limit-v1',
+    institution: 'demo-bank',
+    currency: 'KRW',
+    limit: 1000000,
+    decisionWindow: 60
+  };
+  const entries = [];
+  const baseTrust = {
+    chainId: witness.context.chainId,
+    evidenceLogAddress: witness.context.evidenceLogAddress,
+    depth: witness.context.depth,
+    customerAddress: witness.context.customerAddress,
+    institutionAddress: witness.context.institutionAddress,
+    policy,
+    customerKey: keys.customer.publicKey.export({ type: 'spki', format: 'pem' }),
+    institutionKey: keys.institution.publicKey.export({ type: 'spki', format: 'pem' })
+  };
+
+  async function register(evidence, send) {
+    const bytes = encodePayload(evidence);
+    const envelopeSnapshot = structuredClone(evidence);
+    await onPayload(bytes, envelopeSnapshot);
+
+    const registration = await send(bytes);
+    try {
+      const record = registration.entry;
+      const entry = {
+        payloadBytes: bytes,
+        record,
+        txHash: registration.txHash
+      };
+      const updatedEntries = [...entries, entry];
+      const entriesSnapshot = structuredClone(updatedEntries);
+      await onAppend(entriesSnapshot);
+      entries.push(entry);
+      return entry;
+    } catch (error) {
+      error.txHash = registration.txHash;
+      error.registration = registration;
+      throw error;
+    }
+  }
+
+  async function submit(id, amount) {
+    const payload = {
+      version: 1,
+      id,
+      customer: 'demo-customer',
+      institution: policy.institution,
+      amount,
+      currency: 'KRW',
+      policyHash: hash(policy)
+    };
+    const envelope = sign('request', payload, keys.customer.privateKey);
+    requestPayload(envelope, baseTrust);
+
+    const hasDuplicateRequest = entries.some(e => {
+      if (BigInt(e.record.kind) !== 0n) return false;
+      if (e.record.actor.toLowerCase() !== baseTrust.customerAddress.toLowerCase()) return false;
+
+      const existingEnvelope = decodePayload(e.payloadBytes, e.record);
+      return existingEnvelope.payload.id === id;
+    });
+    requireThat(!hasDuplicateRequest, 'DUPLICATE_REQUEST');
+    return register(envelope, bytes => witness.registerRequest(bytes));
+  }
+
+  async function decide(request) {
+    requireThat(request?.txHash, 'REQUEST_NOT_RECEIVED');
+    const registration = await witness.readRecord(request.txHash);
+    const record = registration.entry;
+    requireThat(
+      record && BigInt(record.kind) === 0n
+      && record.actor.toLowerCase() === baseTrust.customerAddress.toLowerCase(),
+      'INVALID_REQUEST_REGISTRATION'
+    );
+    const suppliedRecordHash = leafHash(request.record, baseTrust);
+    const registeredRecordHash = leafHash(record, baseTrust);
+    requireThat(suppliedRecordHash === registeredRecordHash, 'REGISTRATION_MISMATCH');
+    const envelope = decodePayload(request.payloadBytes, record);
+    const r = requestPayload(envelope, baseTrust);
+
+    const hasDuplicateRequest = entries.some(e => {
+      if (BigInt(e.record.kind) !== 0n) return false;
+      if (e.record.actor.toLowerCase() !== baseTrust.customerAddress.toLowerCase()) return false;
+
+      const existingEnvelope = decodePayload(e.payloadBytes, e.record);
+      if (existingEnvelope.payload.id !== r.id) return false;
+
+      return BigInt(e.record.index) !== BigInt(record.index);
+    });
+    requireThat(!hasDuplicateRequest, 'DUPLICATE_REQUEST');
+
+    const hasDuplicateDecision = entries.some(e => {
+      if (BigInt(e.record.kind) !== 1n) return false;
+      return BigInt(e.record.requestIndex) === BigInt(record.index);
+    });
+    requireThat(!hasDuplicateDecision, 'DUPLICATE_DECISION');
+
+    const payload = {
+      version: 1,
+      requestHash: hash(envelope),
+      policyHash: hash(policy),
+      ...expectedDecision(r)
+    };
+    const decision = sign('decision', payload, keys.institution.privateKey);
+    return register(decision, bytes => witness.registerDecision(record.index, bytes));
+  }
+
+  async function trust(txHash) {
+    const registration = txHash === undefined
+      ? await witness.checkpoint()
+      : await witness.readRecord(txHash);
+    return {
+      ...baseTrust,
+      checkpointId: registration.checkpointId,
+      checkpoint: registration.checkpoint
+    };
+  }
+
+  const bundle = (request, decision, trust) => {
+    const list = entries.slice(0, safeNumber(trust.checkpoint.size));
+    const rawRecords = list.map(entry => entry.record);
+    const { checkpointInfo: info, tree } = checkedLog(rawRecords, trust);
+    const item = (candidate, kind) => {
+      requireThat(candidate?.record, 'MISSING_EVIDENCE');
+      const index = safeNumber(candidate.record.index);
+      const entry = list[index];
+      requireThat(
+        entry && BigInt(entry.record.kind) === kind,
+        'EVIDENCE_NOT_IN_CHECKPOINT'
+      );
+      const candidateHash = leafHash(candidate.record, baseTrust);
+      const storedHash = leafHash(entry.record, baseTrust);
+      requireThat(candidateHash === storedHash, 'EVIDENCE_NOT_IN_CHECKPOINT');
+      return { entry, proof: tree.proof(index) };
+    };
+
+    const result = {
+      checkpointId: info.checkpointId,
+      request: item(request, 0n)
+    };
+    if (decision !== undefined) {
+      result.decision = item(decision, 1n);
+    }
+
+    return structuredClone(result);
+  };
+
+  return {
+    keys,
+    entries,
+    policy,
+    submit,
+    decide,
+    trust,
+    bundle,
   };
 }

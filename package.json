@@ -1,1 +1,17 @@
-{"name":"trust404-track3","private":true,"type":"module","scripts":{"test":"node --test","demo":"node src/cli.js demo"},"engines":{"node":">=22"}}
+{
+  "name": "trust404-track3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/evidence.test.js test/evm.test.js test/cli.test.js",
+    "test:anvil": "node scripts/test-anvil.js",
+    "demo": "node src/cli.js demo"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@openzeppelin/merkle-tree": "^1.0.8",
+    "ethers": "^6.17.0"
+  }
+}
