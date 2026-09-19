@@ -5,7 +5,7 @@ import {
   createSystem, verifyReceipt, verifySingle, audit, canonical, sign, hash,
   decodePayload, encodePayload, requestPayload,
 } from '../src/evidence.js';
-import { createTestWitness, entryView, alterPayload, fixture, disk, OTHER } from './helpers.js';
+import { createTestWitness, entryView, receiptFor, recordedReceipt, alterPayload, fixture, disk, OTHER } from './helpers.js';
 import { buildTree } from '../src/evm.js';
 
 test('original canonical bytes, SHA-256 links and Ed25519 signatures remain stable', () => {
@@ -29,7 +29,7 @@ test('R3: limit boundaries through the existing system interface', async () => {
 test('R1–R5: receipt and single evidence verify independently offline', async () => {
   const witness = createTestWitness(); const s = createSystem({ witness });
   const request = await s.submit('req-1', 1500000);
-  const receiptTrust = await s.trust(request.txHash);
+  const receiptTrust = await s.trust(request.checkpointId);
   const receipt = s.bundle(request, undefined, receiptTrust);
   assert.deepEqual(Object.keys(receipt), ['checkpointId', 'request']);
   assert.deepEqual(Object.keys(receiptTrust).sort(), [
@@ -37,8 +37,8 @@ test('R1–R5: receipt and single evidence verify independently offline', async 
     'policy', 'customerKey', 'institutionKey', 'checkpointId', 'checkpoint',
   ].sort());
   assert.equal(verifyReceipt(disk(receipt), disk(receiptTrust)).ok, true);
-  assert.deepEqual(Object.keys(request).sort(), ['payloadBytes', 'record', 'txHash']);
-  const decision = await s.decide(request);
+  assert.deepEqual(Object.keys(request).sort(), ['checkpointId', 'payloadBytes', 'record']);
+  const decision = await s.decide(disk(receipt));
   const trust = await s.trust();
   assert.deepEqual(verifySingle(disk(s.bundle(request, decision, trust)), disk(trust)), {
     ok: true, requestId: 'req-1', amount: 1500000, outcome: 'REJECTED', reason: 'LIMIT_EXCEEDED',
@@ -67,6 +67,104 @@ test('R1,R3–R5: altered bytes, metadata and proofs fail', async () => {
   }
 });
 
+test('institution decides from customer receipt without transaction hashes or a local request log', async () => {
+  const witness = createTestWitness();
+  const customer = createSystem({ witness });
+  const request = await customer.submit('external-receipt', 1500000);
+  const receipt = disk(await receiptFor(customer, request));
+  const institution = createSystem({ witness, keys: customer.keys });
+  witness.readRecord = async () => assert.fail('UNEXPECTED_RECEIPT_READ');
+  witness.checkpoint = async () => assert.fail('UNEXPECTED_CHECKPOINT_ISSUE');
+  const reads = [];
+  const readCheckpoint = witness.readCheckpoint;
+  witness.readCheckpoint = async id => { reads.push(id); return readCheckpoint(id); };
+
+  const decision = await institution.decide(receipt);
+  assert.deepEqual(reads, [receipt.checkpointId]);
+  assert.deepEqual(institution.entries, [decision]);
+  assert.equal(Object.hasOwn(decision, 'txHash'), false);
+  assert.equal(Object.hasOwn(request, 'txHash'), false);
+  assert.equal(Object.hasOwn(receipt.request.entry, 'txHash'), false);
+  const envelope = decodePayload(decision.payloadBytes, decision.record);
+  assert.equal(envelope.payload.outcome, 'REJECTED');
+  assert.equal(envelope.payload.requestHash, hash(decodePayload(request.payloadBytes, request.record)));
+  customer.entries.push(decision);
+  const trust = await customer.trust(decision.checkpointId);
+  assert.equal(verifySingle(customer.bundle(request, decision, trust), trust).ok, true);
+});
+
+test('decision requires receipt inclusion against the fetched checkpoint before persisting or registering', async () => {
+  const witness = createTestWitness();
+  let stored = 0;
+  const s = createSystem({ witness, onPayload() { stored++; } });
+  const request = await s.submit('checked-before-decision', 10);
+  const receipt = await receiptFor(s, request);
+  witness.checkpoint = async () => assert.fail('UNEXPECTED_CHECKPOINT_ISSUE');
+  const cases = [
+    [r => { delete r.checkpointId; }, /MISSING_EVIDENCE/],
+    [r => { r.checkpointId = null; }, /MISSING_EVIDENCE/],
+    [r => { r.checkpointId = 999n; }, /CHECKPOINT_NOT_FOUND/],
+    [r => { delete r.request; }, /MISSING_EVIDENCE/],
+    [r => { r.request.proof.pop(); }, /INVALID_PROOF_LENGTH/],
+    [r => { r.request.proof[0] = `0x${hash('wrong-sibling')}`; }, /INVALID_INCLUSION_PROOF/],
+    [r => { r.request.entry.record.payloadHash = `0x${hash('other')}`; }, /INVALID_INCLUSION_PROOF/],
+    [r => { r.request.entry.payloadBytes = encodePayload(sign('request', {
+      ...decodePayload(request.payloadBytes, request.record).payload, amount: 20,
+    }, s.keys.customer.privateKey)); }, /PAYLOAD_HASH_MISMATCH/],
+  ];
+  for (const [mutate, error] of cases) {
+    const invalid = structuredClone(receipt);
+    mutate(invalid);
+    await assert.rejects(s.decide(invalid), error);
+  }
+  await assert.rejects(s.decide(request), /MISSING_EVIDENCE/);
+
+  const forged = structuredClone(receipt);
+  forged.request.entry.record.recordedAt--;
+  const tree = buildTree([forged.request.entry.record], witness.context);
+  forged.request.proof = tree.proof(0);
+  forged.checkpoint = { size: 1n, root: tree.root, issuedAt: 1000n };
+  await assert.rejects(s.decide(forged), /INVALID_INCLUSION_PROOF/);
+  assert.equal(witness.calls.length, 1);
+  assert.equal(stored, 1);
+  assert.equal(s.entries.length, 1);
+});
+
+test('decision rejects anchored wrong actors, signatures, schemas and decision records as requests', async () => {
+  for (const variant of ['actor', 'signature', 'schema']) {
+    const witness = createTestWitness();
+    const s = createSystem({ witness });
+    const request = await s.submit('valid', 1);
+    const original = decodePayload(request.payloadBytes, request.record);
+    const bytes = encodePayload(sign('request', {
+      ...original.payload, id: variant, ...(variant === 'schema' ? { extra: true } : {}),
+    }, variant === 'signature' ? s.keys.institution.privateKey : s.keys.customer.privateKey));
+    const entry = entryView(witness.record(bytes, variant === 'actor' ? { actor: OTHER } : {}), bytes);
+    const error = { actor: /ACTOR_MISMATCH/, signature: /INVALID_SIGNATURE/, schema: /INVALID_SCHEMA/ }[variant];
+    await assert.rejects(s.decide(await recordedReceipt(witness, entry)), error);
+    assert.equal(witness.calls.length, 1);
+  }
+  const { s, witness, bundle } = await fixture();
+  const count = witness.calls.length;
+  await assert.rejects(s.decide({ checkpointId: bundle.checkpointId, request: bundle.decision }), /EXPECTED_REQUEST/);
+  assert.equal(witness.calls.length, count);
+});
+
+test('decision uses a receipt snapshot across the asynchronous checkpoint read', async () => {
+  const witness = createTestWitness();
+  const s = createSystem({ witness });
+  const request = await s.submit('snapshot', 1);
+  const receipt = await receiptFor(s, request);
+  const readCheckpoint = witness.readCheckpoint;
+  witness.readCheckpoint = async id => {
+    receipt.request.entry.payloadBytes = '0x00';
+    receipt.request.proof.length = 0;
+    return readCheckpoint(id);
+  };
+  const decision = await s.decide(receipt);
+  assert.equal(decodePayload(decision.payloadBytes, decision.record).payload.outcome, 'APPROVED');
+});
+
 test('R3,R5: a genuinely anchored false institution decision fails policy validation', async () => {
   const witness = createTestWitness(); const s = createSystem({ witness });
   const request = await s.submit('req-1', 1500000);
@@ -82,7 +180,7 @@ test('R3,R5: a genuinely anchored false institution decision fails policy valida
 
 test('R6: complete log covers approval and rejection, retaining summary fields', async () => {
   const { s } = await fixture();
-  const r = await s.submit('req-2', 500000); await s.decide(r);
+  const r = await s.submit('req-2', 500000); await s.decide(await receiptFor(s, r));
   const result = audit(s.entries, await s.trust());
   assert.deepEqual(result, { ok: true, requests: 2, decisions: 2, pending: [], overdue: [] });
 });
@@ -93,7 +191,7 @@ test('audit preserves deadline precision at the safe integer boundary and reject
   witness.time = Number.MAX_SAFE_INTEGER - 60;
   const request = await s.submit('boundary-time', 1);
   witness.time = Number.MAX_SAFE_INTEGER;
-  await s.decide(request);
+  await s.decide(await receiptFor(s, request));
   const trust = disk(await s.trust());
   const entries = disk(s.entries);
 
@@ -138,7 +236,7 @@ test('R2,R6: missing decisions use checkpoint time; later decisions preserve pas
   const pastTrust = await s.trust(); const pastEntries = structuredClone(s.entries);
   assert.deepEqual(audit(pastEntries, pastTrust).overdue, ['forgotten']);
   witness.time = 1061;
-  const decision = await s.decide(request); const trust = await s.trust();
+  const decision = await s.decide(await receiptFor(s, request)); const trust = await s.trust();
   assert.equal(verifySingle(s.bundle(request, decision, trust), trust).ok, true);
   assert.deepEqual(audit(s.entries, trust), {
     ok: true, requests: 1, decisions: 1, pending: [], overdue: [],
@@ -161,7 +259,7 @@ test('extra arguments do not override witness timestamps', async () => {
   assert.equal(request.record.recordedAt, 1000n);
 
   witness.time = 1050;
-  const decision = await s.decide(request, 9999);
+  const decision = await s.decide(await receiptFor(s, request), 9999);
   assert.equal(decision.record.recordedAt, 1050n);
   const trust = await s.trust(undefined, 9999);
   assert.equal(trust.checkpoint.issuedAt, 1050n);
@@ -252,9 +350,10 @@ test('R2,R3: originals persist before sending and post-registration failure is r
   assert.equal(after.calls.length, 1); assert.equal(second.entries.length, 0);
   assert.equal(bytes.length, 1);
   fail = false;
-  const trust = await second.trust(txHash);
+  const registration = await after.readRecord(txHash);
+  const trust = await second.trust(registration.checkpointId);
   assert.equal(second.entries.length, 0, 'checkpoint lookup does not restore local records');
-  const request = entryView(await after.readRecord(txHash), bytes[0]);
+  const request = entryView(registration, bytes[0]);
   second.entries.push(request);
   assert.equal(verifyReceipt(second.bundle(request, undefined, trust), trust).ok, true);
   assert.equal(after.calls.length, 1);
@@ -267,7 +366,7 @@ test('institution and offline verifier share the exact envelope schema', async (
   const bytes = encodePayload({ ...decodePayload(good.payloadBytes, good.record), extra: true });
   const request = entryView(await witness.registerRequest(bytes), bytes);
   const count = witness.calls.length;
-  await assert.rejects(s.decide(request), /INVALID_ENVELOPE/);
+  await assert.rejects(s.decide(await recordedReceipt(witness, request)), /INVALID_ENVELOPE/);
   const trust = await s.trust();
   s.entries[request.record.index] = request;
   assert.throws(() => verifyReceipt(s.bundle(request, undefined, trust), trust), /INVALID_ENVELOPE/);
@@ -277,12 +376,13 @@ test('institution and offline verifier share the exact envelope schema', async (
 test('repeated decisions and different registrations with the same request ID are rejected', async () => {
   const witness = createTestWitness(); const s = createSystem({ witness });
   const request = await s.submit('same-id', 10);
-  await s.decide(request);
-  await assert.rejects(s.decide(request), /DUPLICATE_DECISION/);
+  const receipt = await receiptFor(s, request);
+  await s.decide(receipt);
+  await assert.rejects(s.decide(receipt), /DUPLICATE_DECISION/);
   assert.equal(witness.calls.length, 2);
   const bytes = encodePayload(sign('request', { ...decodePayload(request.payloadBytes, request.record).payload, amount: 20 }, s.keys.customer.privateKey));
   const duplicate = entryView(await witness.registerRequest(bytes), bytes);
-  await assert.rejects(s.decide(duplicate), /DUPLICATE_REQUEST/);
+  await assert.rejects(s.decide(await recordedReceipt(witness, duplicate)), /DUPLICATE_REQUEST/);
   const trust = await s.trust(); s.entries[duplicate.record.index] = duplicate;
   assert.throws(() => audit(s.entries, trust), /DUPLICATE_REQUEST/);
 });
@@ -291,14 +391,15 @@ test('failed registrations leave the local log unchanged and can be retried expl
   for (const status of ['FAILED', 'NOT_SENT']) {
     const witness = createTestWitness(); const s = createSystem({ witness });
     const request = await s.submit('retry', 1); const registerDecision = witness.registerDecision;
+    const receipt = await receiptFor(s, request);
     witness.registerDecision = async () => {
       throw Object.assign(new Error('SEND_FAILED'), { registrationStatus: status,
         txHash: status === 'FAILED' ? `0x${hash('failed')}` : undefined });
     };
-    await assert.rejects(s.decide(request), /SEND_FAILED/);
+    await assert.rejects(s.decide(receipt), /SEND_FAILED/);
     witness.registerDecision = registerDecision;
     assert.equal(s.entries.length, 1);
-    assert.equal((await s.decide(request)).record.kind, 1n);
+    assert.equal((await s.decide(receipt)).record.kind, 1n);
     assert.equal(witness.calls.length, 2);
   }
 });
@@ -329,7 +430,7 @@ test('missing or mismatched originals cannot make an on-time registration valid'
 
 test('valid inclusion paths cannot mix a request with another request decision', async () => {
   const { s, request } = await fixture();
-  const other = await s.submit('other', 10); const decision = await s.decide(other);
+  const other = await s.submit('other', 10); const decision = await s.decide(await receiptFor(s, other));
   const trust = await s.trust();
   assert.throws(() => verifySingle(s.bundle(request, decision, trust), trust), /DECISION_LINK_MISMATCH/);
 });
@@ -356,7 +457,7 @@ test('uncertain customer registrations preserve the original error and recover w
     };
     await assert.rejects(s.submit('uncertain', 1), error => error === failure);
     witness.registerRequest = registerRequest;
-    const trust = await s.trust(registration.txHash);
+    const trust = await s.trust(registration.checkpointId);
     assert.equal(witness.calls.length, 1);
     assert.equal(s.entries.length, 0);
     s.entries.push(entryView(await witness.readRecord(registration.txHash), savedBytes));
@@ -398,31 +499,59 @@ test('only registrations persist entries; checkpoint reads never collect, save o
   assert.deepEqual(saved, [[0n]]);
   await s.trust();
   await s.submit('second', 2);
-  const oldTrust = await s.trust(first.txHash);
+  const oldTrust = await s.trust(first.checkpointId);
   assert.equal(s.entries, entries);
   assert.deepEqual(saved, [[0n], [0n, 1n]]);
   assert.deepEqual(entries.map(entry => entry.record.index), [0n, 1n]);
   assert.equal(verifyReceipt(s.bundle(first, undefined, oldTrust), oldTrust).ok, true);
 });
 
+test('trust reads a selected checkpoint ID without fetching receipts or issuing another checkpoint', async () => {
+  const witness = createTestWitness();
+  const s = createSystem({ witness });
+  const request = await s.submit('selected-checkpoint', 1);
+  const expected = await witness.readCheckpoint(request.checkpointId);
+  witness.readRecord = async () => assert.fail('UNEXPECTED_RECEIPT_READ');
+  witness.checkpoint = async () => assert.fail('UNEXPECTED_CHECKPOINT_ISSUE');
+
+  const trust = await s.trust(String(request.checkpointId));
+  assert.equal(trust.checkpointId, request.checkpointId);
+  assert.deepEqual(trust.checkpoint, expected.checkpoint);
+  assert.equal(verifyReceipt(s.bundle(request, undefined, trust), trust).ok, true);
+  await assert.rejects(s.trust(999n), /CHECKPOINT_NOT_FOUND/);
+  assert.equal(s.entries.length, 1);
+});
+
+test('trust without an ID issues a checkpoint then reads its state by ID', async () => {
+  const witness = createTestWitness();
+  const s = createSystem({ witness });
+  const request = await s.submit('fresh-checkpoint', 1);
+  const checkpoint = witness.checkpoint;
+  witness.checkpoint = async () => {
+    const registration = await checkpoint();
+    return { ...registration, checkpoint: { ...registration.checkpoint, size: 999n } };
+  };
+
+  const trust = await s.trust();
+  assert.notEqual(trust.checkpointId, request.checkpointId);
+  assert.equal(trust.checkpoint.size, 1n);
+  assert.deepEqual(trust.checkpoint, (await witness.readCheckpoint(trust.checkpointId)).checkpoint);
+});
+
 test('checkpoint lookup does not repair a deleted institution log entry', async () => {
   const { s, decision } = await fixture();
   s.entries.pop();
-  const trust = await s.trust(decision.txHash);
+  const trust = await s.trust(decision.checkpointId);
   assert.equal(s.entries.length, 1);
   assert.throws(() => audit(s.entries, trust), /LOG_SIZE_MISMATCH/);
 });
 
 test('a repeated decision never returns a previously saved acknowledgement', async () => {
-  const { s, witness, request, decision } = await fixture();
-  const read = witness.readRecord; let decisionReads = 0;
-  witness.readRecord = async txHash => {
-    if (txHash === decision.txHash) { decisionReads++; throw new Error('REGISTRATION_NOT_CONFIRMED'); }
-    return read(txHash);
-  };
+  const { s, witness, receipt } = await fixture();
+  witness.readRecord = async () => assert.fail('UNEXPECTED_RECEIPT_READ');
   const count = witness.calls.length;
-  await assert.rejects(s.decide(request), /DUPLICATE_DECISION/);
-  assert.equal(decisionReads, 0); assert.equal(witness.calls.length, count);
+  await assert.rejects(s.decide(receipt), /DUPLICATE_DECISION/);
+  assert.equal(witness.calls.length, count);
 });
 
 test('replacing a request at an already decided local index does not reuse an old decision', async () => {
@@ -431,8 +560,8 @@ test('replacing a request at an already decided local index does not reuse an ol
   const bytes = encodePayload(sign('request', { ...decodePayload(request.payloadBytes, request.record).payload, amount: 20 }, s.keys.customer.privateKey));
   const registration = await replacement.registerRequest(bytes);
   const other = entryView(registration, bytes);
-  witness.readRecord = replacement.readRecord;
+  witness.readCheckpoint = replacement.readCheckpoint;
   const count = witness.calls.length;
-  await assert.rejects(s.decide(other), /DUPLICATE_DECISION/);
+  await assert.rejects(s.decide(await recordedReceipt(replacement, other)), /DUPLICATE_DECISION/);
   assert.equal(witness.calls.length, count);
 });

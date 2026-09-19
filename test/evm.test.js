@@ -84,6 +84,11 @@ function fixture({ seeded = true } = {}) {
     interface: iface, runner: customerSigner, getAddress: async () => EVIDENCE_LOG,
     depth: async () => BigInt(context.depth), institution: async () => INSTITUTION,
     connect(signer) { return { ...this, runner: signer }; },
+    async getCheckpoint(checkpointId) {
+      calls.push(['getCheckpoint', checkpointId]);
+      assert(checkpoints.has(checkpointId), 'CHECKPOINT_NOT_FOUND');
+      return structuredClone(checkpoints.get(checkpointId));
+    },
     async registerRequest(hash) {
       const actor = await this.runner.getAddress();
       calls.push(['registerRequest', hash, actor]);
@@ -275,6 +280,32 @@ test('checkpoints are fresh even without new entries and cannot contain an entry
   assert(b.checkpoint.issuedAt > a.checkpoint.issuedAt);
   f.evidenceLog.createCheckpoint = async () => ({ hash: f.receipt.hash, wait: async () => f.receipt });
   await assert.rejects(witness.checkpoint(), /UNEXPECTED_ENTRY/);
+});
+
+test('checkpoint reads use contract state by ID without receipts or transactions', async () => {
+  const f = fixture();
+  const witness = await createEvmWitness({ ...f, deploymentBlock: 10n });
+  f.provider.getTransactionReceipt = async () => assert.fail('UNEXPECTED_RECEIPT_READ');
+  f.receipt.logs = [];
+
+  for (const id of [0n, '1']) {
+    const result = await witness.readCheckpoint(id);
+    assert.deepEqual(result, { checkpointId: BigInt(id), checkpoint: f.checkpoints.get(BigInt(id)) });
+  }
+  f.record();
+  const later = await witness.readCheckpoint(2);
+  assert.equal(later.checkpoint.root, f.checkpoints.get(1n).root);
+  assert(later.checkpoint.issuedAt > f.checkpoints.get(1n).issuedAt);
+  assert.deepEqual(f.calls, [['getCheckpoint', 0n], ['getCheckpoint', 1n], ['getCheckpoint', 2n]]);
+
+  for (const id of [-1n, 2n ** 256n, Number.MAX_SAFE_INTEGER + 1, null]) {
+    await assert.rejects(witness.readCheckpoint(id));
+  }
+  assert.equal(f.calls.length, 3);
+  await assert.rejects(witness.readCheckpoint(999n), /CHECKPOINT_NOT_FOUND/);
+  const failure = new Error('RPC_UNAVAILABLE');
+  f.evidenceLog.getCheckpoint = async () => { throw failure; };
+  await assert.rejects(witness.readCheckpoint(1n), error => error === failure);
 });
 
 test('leaf commitments use double Keccak over ABI encoding and bind every metadata field', () => {

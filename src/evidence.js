@@ -171,7 +171,7 @@ export function decodePayload(bytes, record) {
   return envelope;
 }
 
-export function verifyReceipt(bundle, trust) {
+function receiptPayload(bundle, trust) {
   requireThat(bundle?.request, 'MISSING_EVIDENCE');
   const inclusion = {
     entry: bundle.request.entry?.record,
@@ -182,6 +182,11 @@ export function verifyReceipt(bundle, trust) {
   requireThat(record.kind === 0n, 'EXPECTED_REQUEST');
   const envelope = decodePayload(bundle.request.entry.payloadBytes, record);
   const r = requestPayload(envelope, trust);
+  return { record, envelope, request: r };
+}
+
+export function verifyReceipt(bundle, trust) {
+  const { record, request: r } = receiptPayload(bundle, trust);
   return { ok: true, requestId: r.id, index: safeNumber(record.index) };
 }
 
@@ -306,7 +311,7 @@ export function createSystem({
       const entry = {
         payloadBytes: bytes,
         record,
-        txHash: registration.txHash
+        checkpointId: registration.checkpointId
       };
       const updatedEntries = [...entries, entry];
       const entriesSnapshot = structuredClone(updatedEntries);
@@ -344,20 +349,14 @@ export function createSystem({
     return register(envelope, bytes => witness.registerRequest(bytes));
   }
 
-  async function decide(request) {
-    requireThat(request?.txHash, 'REQUEST_NOT_RECEIVED');
-    const registration = await witness.readRecord(request.txHash);
-    const record = registration.entry;
+  async function decide(receipt) {
     requireThat(
-      record && BigInt(record.kind) === 0n
-      && record.actor.toLowerCase() === baseTrust.customerAddress.toLowerCase(),
-      'INVALID_REQUEST_REGISTRATION'
+      receipt?.request && receipt.checkpointId !== undefined && receipt.checkpointId !== null,
+      'MISSING_EVIDENCE'
     );
-    const suppliedRecordHash = leafHash(request.record, baseTrust);
-    const registeredRecordHash = leafHash(record, baseTrust);
-    requireThat(suppliedRecordHash === registeredRecordHash, 'REGISTRATION_MISMATCH');
-    const envelope = decodePayload(request.payloadBytes, record);
-    const r = requestPayload(envelope, baseTrust);
+    const evidence = structuredClone(receipt);
+    const anchor = await trust(evidence.checkpointId);
+    const { record, envelope, request: r } = receiptPayload(evidence, anchor);
 
     const hasDuplicateRequest = entries.some(e => {
       if (BigInt(e.record.kind) !== 0n) return false;
@@ -386,14 +385,15 @@ export function createSystem({
     return register(decision, bytes => witness.registerDecision(record.index, bytes));
   }
 
-  async function trust(txHash) {
-    const registration = txHash === undefined
-      ? await witness.checkpoint()
-      : await witness.readRecord(txHash);
+  async function trust(checkpointId) {
+    if (checkpointId === undefined) {
+      checkpointId = (await witness.checkpoint()).checkpointId;
+    }
+    const anchor = await witness.readCheckpoint(checkpointId);
     return {
       ...baseTrust,
-      checkpointId: registration.checkpointId,
-      checkpoint: registration.checkpoint
+      checkpointId: anchor.checkpointId,
+      checkpoint: anchor.checkpoint
     };
   }
 
@@ -412,7 +412,8 @@ export function createSystem({
       const candidateHash = leafHash(candidate.record, baseTrust);
       const storedHash = leafHash(entry.record, baseTrust);
       requireThat(candidateHash === storedHash, 'EVIDENCE_NOT_IN_CHECKPOINT');
-      return { entry, proof: tree.proof(index) };
+      const { payloadBytes, record, checkpointId } = entry;
+      return { entry: { payloadBytes, record, checkpointId }, proof: tree.proof(index) };
     };
 
     const result = {

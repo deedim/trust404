@@ -12,7 +12,7 @@ export const disk = value => JSON.parse(json(value));
 export function createTestWitness() {
   const context = { chainId: 31337n, evidenceLogAddress: '0x0000000000000000000000000000000000000003',
     depth: 6, deploymentBlock: 0, customerAddress: CUSTOMER, institutionAddress: INSTITUTION };
-  const records = []; const registrations = new Map(); const calls = [];
+  const records = []; const registrations = new Map(); const checkpoints = new Map(); const calls = [];
   let sequence = 0;
   const witness = { context, records, calls, time: 1000,
     publish(entry = null) {
@@ -21,6 +21,7 @@ export function createTestWitness() {
         checkpoint: { size: BigInt(records.length), root: buildTree(records, context).root, issuedAt: BigInt(witness.time) },
         blockNumber: sequence, blockHash: `0x${hash(`block-${sequence}`)}` };
       registrations.set(result.txHash, structuredClone(result));
+      checkpoints.set(checkpointId, structuredClone(result.checkpoint));
       return structuredClone(result);
     },
     record(bytes, { actor = CUSTOMER, requestIndex } = {}) {
@@ -50,13 +51,29 @@ export function createTestWitness() {
       assert(registrations.has(txHash), 'REGISTRATION_NOT_CONFIRMED');
       return structuredClone(registrations.get(txHash));
     },
+    async readCheckpoint(checkpointId) {
+      checkpointId = BigInt(checkpointId);
+      assert(checkpoints.has(checkpointId), 'CHECKPOINT_NOT_FOUND');
+      return { checkpointId, checkpoint: structuredClone(checkpoints.get(checkpointId)) };
+    },
     async checkpoint() { return witness.publish(); },
   };
   return witness;
 }
 
 export function entryView(registration, bytes) {
-  return { payloadBytes: bytes, record: registration.entry, txHash: registration.txHash };
+  return { payloadBytes: bytes, record: registration.entry, checkpointId: registration.checkpointId };
+}
+
+export async function receiptFor(system, request) {
+  const trust = await system.trust(request.checkpointId);
+  return system.bundle(request, undefined, trust);
+}
+
+export async function recordedReceipt(witness, entry) {
+  const { checkpointId, checkpoint } = await witness.readCheckpoint(entry.checkpointId);
+  const tree = buildTree(witness.records.slice(0, Number(checkpoint.size)), witness.context);
+  return { checkpointId, request: { entry: structuredClone(entry), proof: tree.proof(entry.record.index) } };
 }
 
 export function alterPayload(entry, change) {
@@ -70,7 +87,8 @@ export async function fixture(amount = 1500000) {
   const s = createSystem({ witness });
   const request = await s.submit('req-1', amount);
   witness.time = 1060;
-  const decision = await s.decide(request);
+  const receipt = await receiptFor(s, request);
+  const decision = await s.decide(receipt);
   const trust = await s.trust();
-  return { witness, s, request, decision, trust, bundle: s.bundle(request, decision, trust) };
+  return { witness, s, request, receipt, decision, trust, bundle: s.bundle(request, decision, trust) };
 }

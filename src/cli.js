@@ -50,19 +50,21 @@ async function demo(destination) {
 
     const request = await system.submit('transfer-rejected', 1500000);
 
-    const receiptTrust = await system.trust(request.txHash);
+    const receiptTrust = await system.trust(request.checkpointId);
     const receipt = system.bundle(request, undefined, receiptTrust);
 
     write(join(out, 'customer/receipt.json'), receipt);
     write(join(out, 'customer/receipt-trust.json'), receiptTrust);
     write(join(out, 'institution/transfer-rejected-request.json'), request.payloadBytes);
 
-    const decision = await system.decide(request);
+    const decision = await system.decide(receipt);
 
     const approvedRequest = await system.submit('transfer-approved', 500000);
     write(join(out, 'institution/transfer-approved-request.json'), approvedRequest.payloadBytes);
 
-    const approval = await system.decide(approvedRequest);
+    const approvalTrust = await system.trust(approvedRequest.checkpointId);
+    const approvalReceipt = system.bundle(approvedRequest, undefined, approvalTrust);
+    const approval = await system.decide(approvalReceipt);
 
     const trust = await system.trust();
     const rejection = system.bundle(request, decision, trust);

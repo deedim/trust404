@@ -17,6 +17,7 @@ import {
 import {
   buildTree, checkedLog, checkpointInfo, createEvmWitness, leafHash, payloadHash,
 } from '../src/evm.js';
+import { receiptFor } from './helpers.js';
 
 // Explicitly run with: node --test test/anvil.test.js
 // Requires the installed Anvil/ethers and an already compiled EvidenceLog artifact.
@@ -164,7 +165,7 @@ function view(registration, envelope) {
   const record = registration.entry;
   return {
     payloadBytes: encodePayload(envelope),
-    record: clone(record), txHash: registration.txHash,
+    record: clone(record), checkpointId: registration.checkpointId,
   };
 }
 
@@ -338,11 +339,19 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       return receipt;
     }
 
-    async function metadata(entry, kind, actor) {
-      const receipt = await provider.getTransactionReceipt(entry.txHash);
+    async function registrationFor(f, entry) {
+      const events = await f.contract.queryFilter(
+        f.contract.filters.CheckpointPublished(entry.checkpointId), f.deploymentBlock, 'latest'
+      );
+      assert.equal(events.length, 1);
+      return f.witness.readRecord(events[0].transactionHash);
+    }
+
+    async function metadata(entry, kind, actor, registration) {
+      const receipt = await provider.getTransactionReceipt(registration.txHash);
       const block = await provider.getBlock(receipt.blockNumber);
       assert.equal(receipt.status, 1);
-      assert.deepEqual(Object.keys(entry).sort(), ['payloadBytes', 'record', 'txHash']);
+      assert.deepEqual(Object.keys(entry).sort(), ['checkpointId', 'payloadBytes', 'record']);
       assert.equal(entry.record.recordedAt, BigInt(block.timestamp));
       for (const field of ['index', 'kind', 'requestIndex', 'recordedAt']) assert.equal(typeof entry.record[field], 'bigint');
       assert.equal(entry.record.kind, BigInt(kind));
@@ -400,7 +409,8 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
           order.push({ event: 'mined', registration });
           return registration;
         },
-        async readRecord(txHash) { reads++; return f.witness.readRecord(txHash); },
+        async readCheckpoint(id) { reads++; return f.witness.readCheckpoint(id); },
+        async readRecord() { assert.fail('UNEXPECTED_RECEIPT_READ'); },
       };
       const system = createSystem({
         witness,
@@ -410,7 +420,8 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         },
         onAppend(entries) {
           assert.equal(order.at(-1).event, 'mined');
-          assert.equal(entries.at(-1).txHash, order.at(-1).registration.txHash);
+          assert.equal(entries.at(-1).checkpointId, order.at(-1).registration.checkpointId);
+          assert.equal(Object.hasOwn(entries.at(-1), 'txHash'), false);
           order.push({ event: 'stored' });
         },
       });
@@ -422,8 +433,8 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       for (const [i, amount] of [999_999, 1_000_000, 1_000_001].entries()) {
         const request = await system.submit(`boundary-${amount}`, amount);
         assert.equal(request.record.index, BigInt(i * 2));
-        await metadata(request, 0, customer);
-        const trust = await system.trust(request.txHash);
+        await metadata(request, 0, customer, order.at(-2).registration);
+        const trust = await system.trust(request.checkpointId);
         const receipt = system.bundle(request, undefined, trust);
         assert.equal(receipt.decision, undefined);
         assert.equal(verifyReceipt(receipt, trust).ok, true);
@@ -439,16 +450,18 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
           { payloadBytes: bytes('{}') },
           { record: { ...request.record, recordedAt: request.record.recordedAt + 1n } },
         ]) {
-          await assert.rejects(() => system.decide({ ...clone(request), ...alteration }));
+          const altered = clone(receipt);
+          Object.assign(altered.request.entry, alteration);
+          await assert.rejects(() => system.decide(altered));
         }
         const readsBefore = reads;
-        const decision = await system.decide(request);
-        await assert.rejects(() => system.decide(clone(request)), /DUPLICATE_DECISION/);
-        assert(reads > readsBefore, 'the service must reread the actual request registration');
+        const decision = await system.decide(receipt);
+        await assert.rejects(() => system.decide(clone(receipt)), /DUPLICATE_DECISION/);
+        assert(reads > readsBefore, 'the service must reread the checkpoint from contract state');
         assert.equal(await f.contract.size(), BigInt(i * 2 + 2));
         assert.equal(decision.record.index, BigInt(i * 2 + 1));
         assert.equal(decision.record.requestIndex, request.record.index);
-        await metadata(decision, 1, institution);
+        await metadata(decision, 1, institution, order.at(-2).registration);
         pairs.push({ request, decision });
       }
       const trust = await system.trust();
@@ -589,9 +602,9 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         const g = await fixture();
         const r = await g.system.submit(`elapsed-${elapsed}`, 1_000_001);
         await provider.send('evm_setNextBlockTimestamp', [Number(r.record.recordedAt) + elapsed]);
-        const d = await g.system.decide(r);
+        const d = await g.system.decide(await receiptFor(g.system, r));
         assert.equal(d.record.recordedAt, r.record.recordedAt + BigInt(elapsed));
-        const trust = await g.system.trust(d.txHash);
+        const trust = await g.system.trust(d.checkpointId);
         const bundle = g.system.bundle(r, d, trust);
         const verified = verifySingle(bundle, trust);
         assert.equal(verified.ok, true);
@@ -629,16 +642,17 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       const receipts = await bounded(Promise.all([first, second, decisionTx].map(tx => tx.wait())), 'same-block receipts');
       assert(receipts.every(receipt => receipt.status === 1 && receipt.blockHash === receipts[0].blockHash));
       assert(receipts[0].index < receipts[1].index && receipts[1].index < receipts[2].index);
-      const early = await f.system.trust(first.hash);
       const earlyRegistration = await f.witness.readRecord(first.hash);
+      const early = await f.system.trust(earlyRegistration.checkpointId);
       const earlyEntries = clone(f.system.entries);
       const earlyReceipt = f.system.bundle(request, undefined, early);
-      const other = await f.system.trust(second.hash);
+      const secondRegistration = await f.witness.readRecord(second.hash);
+      const other = await f.system.trust(secondRegistration.checkpointId);
       assert.deepEqual(early.checkpoint, other.checkpoint);
       assert.notEqual(early.checkpointId, other.checkpointId);
       refuses(() => verifyReceipt(earlyReceipt, other));
-      const final = await f.system.trust(decisionTx.hash);
       const finalRegistration = await f.witness.readRecord(decisionTx.hash);
+      const final = await f.system.trust(finalRegistration.checkpointId);
       assert.equal(finalRegistration.blockHash, earlyRegistration.blockHash);
       assert.equal(final.checkpoint.issuedAt, early.checkpoint.issuedAt);
       assert.equal(Number(early.checkpoint.issuedAt), deadline);
@@ -655,7 +669,7 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       assert.equal(verifySingle(evidenceFrom(entries, final, request.record.index, decision.record.index), final).ok, true);
       assert.equal(verifyReceipt(earlyReceipt, early).ok, true);
       f.system.entries.push(decision);
-      await f.system.trust(first.hash);
+      await f.system.trust(earlyRegistration.checkpointId);
       assert.equal(f.system.entries.length, 2, 'reading an old checkpoint must not replace the local log');
       refuses(() => audit(entries, early));
     });
@@ -670,7 +684,7 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       await minedFailure(f, () => f.contract.registerRequest(ZeroHash, { gasLimit }));
       await minedFailure(f, () => f.institutionLog.registerDecision(request.record.index, ZeroHash, { gasLimit }));
       await minedFailure(f, () => f.institutionLog.registerDecision(999, someHash, { gasLimit }));
-      const decision = await f.system.decide(request);
+      const decision = await f.system.decide(await receiptFor(f.system, request));
       await minedFailure(f, () => f.institutionLog.registerDecision(request.record.index, someHash, { gasLimit }));
       await minedFailure(f, () => f.institutionLog.registerDecision(decision.record.index, someHash, { gasLimit }));
       const trust = await f.system.trust();
@@ -683,13 +697,17 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       const foreignTx = await f.outsiderLog.registerRequest(payloadHash(encodePayload(envelope)), { gasLimit });
       await bounded(foreignTx.wait(), 'foreign request receipt');
       const foreign = view(await f.witness.readRecord(foreignTx.hash), envelope);
-      await assert.rejects(() => f.system.decide(foreign));
+      const foreignTrust = await f.system.trust(foreign.checkpointId);
+      const foreignReceipt = evidenceFrom([foreign], foreignTrust, foreign.record.index);
+      await assert.rejects(() => f.system.decide(foreignReceipt), /ACTOR_MISMATCH/);
       const owner = await f.system.submit('shared-hash', 500);
       assert.equal(owner.record.payloadHash, foreign.record.payloadHash);
       assert.equal(owner.record.index, 1n);
       assert.notEqual(owner.record.actor, foreign.record.actor);
-      const decision = await f.system.decide(owner);
-      const trust = await f.system.trust(decision.txHash);
+      const ownerTrust = await f.system.trust(owner.checkpointId);
+      const ownerReceipt = evidenceFrom([foreign, owner], ownerTrust, owner.record.index);
+      const decision = await f.system.decide(ownerReceipt);
+      const trust = await f.system.trust(decision.checkpointId);
       assert.deepEqual(f.system.entries, [owner, decision]);
       assert.throws(() => audit(f.system.entries, trust), /LOG_SIZE_MISMATCH/);
       assert.throws(() => f.system.bundle(owner, decision, trust), /LOG_SIZE_MISMATCH/);
@@ -703,14 +721,16 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
     await scenario('a different registration with the same business ID is refused by the service and audit', { timeout: 15_000 }, async () => {
       const f = await fixture();
       const first = await f.system.submit('duplicate-id', 100);
-      await f.system.decide(first);
+      await f.system.decide(await receiptFor(f.system, first));
       const envelope = requestEnvelope(f.system, 'duplicate-id', 101);
       const registration = await f.witness.registerRequest(encodePayload(envelope));
       const other = view(registration, envelope);
       assert.notEqual(first.record.payloadHash, other.record.payloadHash);
-      await assert.rejects(() => f.system.decide(other));
+      const duplicateTrust = await f.system.trust(other.checkpointId);
+      const duplicateReceipt = evidenceFrom([...f.system.entries, other], duplicateTrust, other.record.index);
+      await assert.rejects(() => f.system.decide(duplicateReceipt), /DUPLICATE_REQUEST/);
       assert.equal(await f.contract.size(), 3n);
-      const trust = await f.system.trust(registration.txHash);
+      const trust = await f.system.trust(registration.checkpointId);
       assert.throws(() => audit([...f.system.entries, other], trust), /DUPLICATE_REQUEST/);
     });
 
@@ -719,7 +739,7 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       const request = await f.system.submit('false-approval', 1_500_000);
       const envelope = decisionEnvelope(f.system, request, { outcome: 'APPROVED', reason: 'WITHIN_LIMIT' });
       const registration = await f.witness.registerDecision(request.record.index, encodePayload(envelope));
-      const trust = await f.system.trust(registration.txHash);
+      const trust = await f.system.trust(registration.checkpointId);
       assert.equal(registration.entry.kind, 1n);
       assert.equal(registration.entry.actor, await institution.getAddress());
       assert.equal(f.system.entries.length, 1);
@@ -734,7 +754,8 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       assert.deepEqual(decodePayload(decision.payloadBytes, decision.record), envelope);
       refuses(() => verifySingle(bundle, trust));
       assert.throws(() => audit(entries, trust), /POLICY_MISMATCH/);
-      await assert.rejects(() => f.system.decide(request));
+      const receipt = await receiptFor(f.system, request);
+      await assert.rejects(() => f.system.decide(receipt));
       assert.equal(await f.contract.size(), 2n);
       const noRequest = clone(entries);
       noRequest[0].payloadBytes = null;
@@ -754,9 +775,11 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         const registration = await f.witness.registerRequest(encodePayload(envelope));
         const request = view(registration, envelope);
         originals.push(request);
-        await assert.rejects(() => f.system.decide(request));
+        const requestTrust = await f.system.trust(request.checkpointId);
+        const receipt = evidenceFrom(originals, requestTrust, request.record.index);
+        await assert.rejects(() => f.system.decide(receipt));
         assert.equal(await f.contract.size(), BigInt(originals.length));
-        const trust = await f.system.trust(registration.txHash);
+        const trust = await f.system.trust(registration.checkpointId);
         const entries = clone(originals);
         const bundle = evidenceFrom(entries, trust, request.record.index);
         refuses(() => verifyReceipt(bundle, trust));
@@ -778,11 +801,15 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         assert.equal(await provider.getTransactionReceipt(transaction.hash), null);
         await assert.rejects(() => f.witness.readRecord(transaction.hash));
         const block = await provider.getBlock('latest');
-        const pendingView = view({ txHash: transaction.hash, entry: {
+        const pendingView = view({ checkpointId: 0n, entry: {
           index: 0n, kind: 0n, requestIndex: 0n, actor: await customer.getAddress(),
           payloadHash: payloadHash(encodePayload(envelope)), recordedAt: BigInt(block.timestamp + 1),
         } }, envelope);
-        await assert.rejects(() => f.system.decide(pendingView));
+        const pendingReceipt = {
+          checkpointId: 0n,
+          request: { entry: pendingView, proof: buildTree([pendingView.record], f.witness.context).proof(0) },
+        };
+        await assert.rejects(() => f.system.decide(pendingReceipt), /ENTRY_OUTSIDE_CHECKPOINT/);
         assert.equal(await f.contract.size(), 0n);
       } finally {
         // Drain the owned pending transaction before restoring automatic mining.
@@ -794,13 +821,15 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       const g = await fixture();
       const snapshot = await provider.send('evm_snapshot', []);
       const request = await g.system.submit('orphaned', 2);
-      const trust = await g.system.trust(request.txHash);
+      const registration = await registrationFor(g, request);
+      const trust = await g.system.trust(request.checkpointId);
       const receipt = g.system.bundle(request, undefined, trust);
       assert.equal(verifyReceipt(receipt, trust).ok, true);
       assert.equal(await provider.send('evm_revert', [snapshot]), true);
       await provider.send('evm_mine', []);
-      await assert.rejects(() => g.witness.readRecord(request.txHash));
-      await assert.rejects(() => g.system.decide(request));
+      await assert.rejects(() => g.witness.readRecord(registration.txHash));
+      await assert.rejects(() => g.system.trust(request.checkpointId));
+      await assert.rejects(() => g.system.decide(receipt));
       assert.equal(await g.contract.size(), 0n);
       // Offline proof checking cannot discover a reorg of a previously trusted anchor.
       assert.equal(verifyReceipt(receipt, trust).ok, true);
@@ -809,24 +838,30 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
     await scenario('repeated decisions are rejected after reorganization without reusing old acknowledgements', { timeout: 20_000 }, async () => {
       const f = await fixture();
       const request = await f.system.submit('cached-decision', 1);
+      const receipt = await receiptFor(f.system, request);
       const beforeDecision = await provider.send('evm_snapshot', []);
-      const decision = await f.system.decide(request);
+      const decision = await f.system.decide(receipt);
+      const registration = await registrationFor(f, decision);
       assert.equal(await f.contract.size(), 2n);
       assert.equal(await provider.send('evm_revert', [beforeDecision]), true);
-      assert.equal(await provider.getTransactionReceipt(decision.txHash), null);
-      await assert.rejects(() => f.system.decide(request), /DUPLICATE_DECISION/);
+      assert.equal(await provider.getTransactionReceipt(registration.txHash), null);
+      await assert.rejects(() => f.system.decide(receipt), /DUPLICATE_DECISION/);
       assert.equal(await f.contract.size(), 1n, 'a locally recorded decision is not automatically resubmitted');
 
       const g = await fixture();
       const beforeRequest = await provider.send('evm_snapshot', []);
       const original = await g.system.submit('replaced-request', 10);
-      await g.system.decide(original);
+      const originalReceipt = await receiptFor(g.system, original);
+      await g.system.decide(originalReceipt);
       assert.equal(await provider.send('evm_revert', [beforeRequest]), true);
       const envelope = requestEnvelope(g.system, 'replaced-request', 20);
       const replacement = view(await g.witness.registerRequest(encodePayload(envelope)), envelope);
       assert.equal(replacement.record.index, original.record.index);
       assert.notEqual(replacement.record.payloadHash, original.record.payloadHash);
-      await assert.rejects(() => g.system.decide(replacement), /DUPLICATE_DECISION/);
+      const replacementTrust = await g.system.trust(replacement.checkpointId);
+      const replacementReceipt = evidenceFrom([replacement], replacementTrust, 0);
+      await assert.rejects(() => g.system.decide(originalReceipt), /INVALID_INCLUSION_PROOF/);
+      await assert.rejects(() => g.system.decide(replacementReceipt), /DUPLICATE_DECISION/);
       assert.equal(await g.contract.size(), 1n);
     });
 
@@ -848,17 +883,18 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       assert.deepEqual(await state(f), before);
       controls.customer.low = false;
       const request = await f.system.submit('gas-retry', 100);
-      assert.notEqual(request.txHash, error.txHash);
+      assert.notEqual((await registrationFor(f, request)).txHash, error.txHash);
       assert.equal(controls.customer.sends, 2);
       const beforeDecision = await state(f);
-      const decisionError = await rejected(() => f.system.decide(request));
+      const requestReceipt = await receiptFor(f.system, request);
+      const decisionError = await rejected(() => f.system.decide(requestReceipt));
       assert.match(decisionError.txHash, /^0x[0-9a-f]{64}$/i);
       assert.equal((await provider.getTransactionReceipt(decisionError.txHash)).status, 0);
       assert.deepEqual(await state(f), beforeDecision);
       controls.institution.low = false;
-      const decision = await f.system.decide(request);
+      const decision = await f.system.decide(requestReceipt);
       assert.equal(controls.institution.sends, 2);
-      const trust = await f.system.trust(decision.txHash);
+      const trust = await f.system.trust(decision.checkpointId);
       assert.equal(verifySingle(f.system.bundle(request, decision, trust), trust).ok, true);
       assert.equal(audit(f.system.entries, trust).ok, true);
     });
@@ -903,7 +939,7 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         assert.equal(await f.contract.size(), 1n);
         const registration = await f.witness.readRecord(error.txHash);
         assert.equal(registration.txHash, error.txHash);
-        const trust = await f.system.trust(error.txHash);
+        const trust = await f.system.trust(registration.checkpointId);
         assert.equal(f.system.entries.length, 0);
         f.system.entries.push(view(registration, savedEnvelope));
         assert.equal(verifyReceipt(f.system.bundle(f.system.entries[0], undefined, trust), trust).ok, true);
@@ -931,24 +967,26 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       const error = await rejected(() => f.system.submit('storage-recovery', 300), /INJECTED_ON_APPEND_STORAGE_FAILURE/);
       assert.match(error.txHash, /^0x[0-9a-f]{64}$/i);
       assert.equal((await provider.getTransactionReceipt(error.txHash)).status, 1);
-      assert.equal(stored[0].txHash, error.txHash);
+      assert.equal(Object.hasOwn(stored[0], 'txHash'), false);
+      assert.equal(error.registration.txHash, error.txHash);
       assert.equal(await f.contract.size(), 1n);
       failStorage = false;
-      const trust = await f.system.trust(error.txHash);
+      const registration = await f.witness.readRecord(error.txHash);
+      const trust = await f.system.trust(registration.checkpointId);
       assert.equal(f.system.entries.length, 0);
       const recovered = {
-        record: (await f.witness.readRecord(error.txHash)).entry,
+        record: registration.entry,
         payloadBytes: stored[0].payloadBytes,
-        txHash: error.txHash,
+        checkpointId: registration.checkpointId,
       };
       f.system.entries.push(recovered);
-      assert.equal(recovered.txHash, error.txHash);
+      assert.equal(Object.hasOwn(recovered, 'txHash'), false);
       assert.equal(recovered.payloadBytes, stored[0].payloadBytes);
       const receipt = f.system.bundle(recovered, undefined, trust);
       assert.equal(verifyReceipt(receipt, trust).ok, true);
       assert.equal(await f.contract.size(), 1n);
-      const decision = await f.system.decide(recovered);
-      const final = await f.system.trust(decision.txHash);
+      const decision = await f.system.decide(receipt);
+      const final = await f.system.trust(decision.checkpointId);
       assert.equal(audit(f.system.entries, final).ok, true);
       await offlineCase('recovered-storage-receipt', 'receipt', receipt, trust, 0);
     });
@@ -966,6 +1004,16 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
       assert.equal(typeof trust.checkpoint.size, 'string', 'bigints persist as decimal strings');
       assert.match(trust.checkpoint.size, /^(0|[1-9][0-9]*)$/);
       const savedLog = JSON.parse(await readFile(join(out, 'witness/log.json'), 'utf8'));
+      const missingTrustPath = join(out, 'attacks/missing-trust.json');
+      const missingTrust = JSON.parse(await readFile(missingTrustPath, 'utf8'));
+      const missingLog = JSON.parse(await readFile(join(out, 'attacks/missing-log.json'), 'utf8'));
+      const unanswered = missingLog.at(-1);
+      assert.equal(decodePayload(unanswered.payloadBytes, unanswered.record).payload.id, 'unanswered');
+      assert(BigInt(missingTrust.checkpoint.issuedAt) >= BigInt(unanswered.record.recordedAt) + 60n);
+      const wrongPolicyTrustPath = join(out, 'attacks/wrong-policy-trust.json');
+      const wrongPolicyTrust = JSON.parse(await readFile(wrongPolicyTrustPath, 'utf8'));
+      const wrongPolicyResult = JSON.parse(await readFile(join(out, 'attacks/wrong-policy-result.json'), 'utf8'));
+      const wrongPolicyLog = [...missingLog, wrongPolicyResult.request.entry, wrongPolicyResult.decision.entry];
       assert.equal(Array.isArray(savedLog), true);
       assert.equal(Array.isArray(JSON.parse(await readFile(join(out, 'institution/decisions.json'), 'utf8'))), true);
       assert(!persistedTrust.includes('PRIVATE KEY'));
@@ -982,7 +1030,13 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         institutionSigner: await provider.getSigner(trust.institutionAddress),
         deploymentBlock: context.deploymentBlock,
       });
-      for (const anchor of [trust, receiptTrust]) {
+      for (const [anchor, log] of [
+        [trust, savedLog], [receiptTrust, savedLog],
+        [missingTrust, missingLog], [wrongPolicyTrust, wrongPolicyLog],
+      ]) {
+        const fromState = await demoWitness.readCheckpoint(anchor.checkpointId);
+        assert.equal(fromState.checkpointId, BigInt(anchor.checkpointId));
+        assert.deepEqual(JSON.parse(json(fromState.checkpoint)), anchor.checkpoint);
         const events = await demoContract.queryFilter(
           demoContract.filters.CheckpointPublished(anchor.checkpointId),
           Number(context.deploymentBlock),
@@ -991,7 +1045,7 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         assert.equal(events.length, 1);
         const observed = await demoWitness.readRecord(events[0].transactionHash);
         assert.deepEqual(checkpointInfo({ ...demoWitness.context, ...observed }), checkpointInfo(anchor));
-        const entries = savedLog.map(entry => entry.record)
+        const entries = log.map(entry => entry.record)
           .filter(entry => BigInt(entry.index) < BigInt(anchor.checkpoint.size));
         checkedLog(entries, anchor);
         assert.equal(BigInt(entries.length), BigInt(anchor.checkpoint.size));
@@ -1012,6 +1066,12 @@ test('src API against a dedicated local Anvil, including offline CLI recovery', 
         runCli(['verify', join(out, `attacks/${name}.json`), trustPath], 1);
       }
       runCli(['audit', join(out, 'attacks/deleted-log.json'), trustPath], 1);
+      const missingReport = runCli(['audit', join(out, 'attacks/missing-log.json'), missingTrustPath], 1);
+      assert.deepEqual(missingReport, {
+        ok: false, requests: 3, decisions: 2, pending: [], overdue: ['unanswered'],
+      });
+      const wrongPolicyReport = runCli(['verify', join(out, 'attacks/wrong-policy-result.json'), wrongPolicyTrustPath], 1);
+      assert.equal(wrongPolicyReport.error, 'POLICY_MISMATCH');
       runCli(['verify', join(out, 'does-not-exist.json'), trustPath], 1);
       for (const item of offlineCases) {
         const result = runCli([item.command, item.file, item.anchor], item.status);

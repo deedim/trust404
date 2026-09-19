@@ -352,6 +352,12 @@ export async function createEvmWitness({ evidenceLog, institutionSigner, deploym
       return readRecord(evidenceLog, txHash, context);
     },
 
+    async readCheckpoint(checkpointId) {
+      checkpointId = uint(checkpointId);
+      const checkpoint = checkpointOf(await evidenceLog.getCheckpoint(checkpointId));
+      return { checkpointId, checkpoint };
+    },
+
     checkpoint() {
       return sendAndReadRecord(evidenceLog, context, 'createCheckpoint', []);
     },
